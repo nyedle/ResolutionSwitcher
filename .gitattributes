@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.iss text eol=crlf
+installer/portable-readme.txt text eol=crlf
+
+*.ico binary
+*.png binary
+*.webp binary

@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+      - name: Tag agrees with the crate and the changelog
+        if: github.ref_type == 'tag'
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $crate = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $crate) {
+            throw "tag is v$tag but Cargo.toml says $crate. Bump one of them."
+          }
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## $([regex]::Escape($tag))$" -Quiet)) {
+            throw "CHANGELOG.md has no '## $tag' section."
+          }
+          Write-Host "v$tag matches Cargo.toml and has a changelog entry"
+
+  build:
+    needs: check
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Inno Setup
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y
+            echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+          }
+
+      - name: Build and pack
+        run: |
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "0.0.0" }
+          .\scripts\pack.ps1 -Arch ${{ matrix.arch }} -Version $version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ResolutionSwitcher-${{ matrix.arch }}
+          path: |
+            dist\ResolutionSwitcher-Setup-${{ matrix.arch }}.exe
+            dist\ResolutionSwitcher-${{ matrix.arch }}-portable.zip
+            dist\resolution-switcher-${{ matrix.arch }}.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 == "## " v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ -s notes.md ]; then
+            echo "using the $version section of CHANGELOG.md:"
+            cat notes.md
+          else
+            echo "::warning::CHANGELOG.md has no '## $version' section"
+            echo "See [CHANGELOG.md](CHANGELOG.md)." > notes.md
+          fi
+
+      - name: Attest provenance
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            artifacts/resolution-switcher-*.exe
+            artifacts/ResolutionSwitcher-Setup-*.exe
+            artifacts/ResolutionSwitcher-*-portable.zip
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          body_path: notes.md
+          generate_release_notes: true
